@@ -7,25 +7,33 @@ import networkx as nx
 import psycopg2
 import json
 from shapely.geometry import mapping
-from contextlib import contextmanager
+
 
 def epsg_calc(lat, lon):
-   
     try:
+        # Validate input coordinates
+        if not (-90 <= lat <= 90):
+            raise ValueError(f"Invalid latitude: {lat}")
+        if not (-180 <= lon <= 180):
+            raise ValueError(f"Invalid longitude: {lon}")
+
         # Create a GeoDataFrame for the given point
         point = gpd.GeoDataFrame(
             {'geometry': [Point(lon, lat)]},
             crs="EPSG:4326"  # WGS84
         )
-
         # Estimate the best UTM CRS
         best_crs = point.estimate_utm_crs()
-        print(f"Best UTM CRS determined: {best_crs.to_string()}")
-        return best_crs
+        # Extract the EPSG code as an integer
+        epsg_code = best_crs.to_epsg()
+        if epsg_code is None:
+            raise ValueError("Could not determine a valid EPSG code from the UTM CRS")
+        print(f"Best UTM CRS determined: EPSG:{epsg_code}")
+        return epsg_code
 
     except Exception as e:
-        print(f"An error occurred while determining the best EPSG: {e}")
-        return None
+        print(f"Error determining EPSG code: {e}")
+        raise ValueError(f"Failed to calculate EPSG code: {e}")
 
 def bbox_calc(lat, lon, time_budget, travel_speed):
     max_distance = travel_speed * time_budget  # In meters
@@ -40,7 +48,7 @@ def bbox_calc(lat, lon, time_budget, travel_speed):
     return bbox   #(left, bottom, right, top). 
 
 
-def features_calc(lat, lon, bbox, epsg, bounding_poly, features_to_fetch):
+def features_calc(lat, lon, bbox, epsg, bounding_poly,features_to_fetch):
     # Define OSM tag mappings
     tag_map = {
         "water": {"natural": "water"},
@@ -126,22 +134,24 @@ def features_calc(lat, lon, bbox, epsg, bounding_poly, features_to_fetch):
             "mean_dist_m": dists.mean()
         })
 
-            # Convert results to DataFrame and include bounding_poly as GeoJSON
-        df = pd.DataFrame(results)
-        proximity_data = {
-            "type": "FeatureCollection",
-            "features": [{
-                "type": "Feature",
-                "geometry": mapping(bounding_poly),  # Isochrone polygon as GeoJSON
-                "properties": df.to_dict(orient='records')  # Embed feature stats
-            }]
-        }
+    feature_summary = {
+    item["feature"]: {
+        "count": item["count"],
+        "total_area_m2": item["total_area_m2"],
+        "nearest_dist_m": item["nearest_dist_m"],
+        "mean_dist_m": item["mean_dist_m"]
+    }
+    for item in results
+    }
 
-    return proximity_data
+    return feature_summary
 
-# Context manager for database connection
-@contextmanager
-def get_db_connection():
+def sociodemo_calc(bounding_poly):
+
+  
+    poly_geojson = json.dumps(mapping(bounding_poly))
+
+    # Connect to Supabase (Postgres)
     conn = psycopg2.connect(
         dbname="postgres",
         user="postgres",
@@ -149,184 +159,127 @@ def get_db_connection():
         host="db.fiuxnvanhbujhwdwygto.supabase.co",
         port="5432"
     )
-    try:
-        yield conn
-    finally:
-        conn.close()
+    cursor = conn.cursor()
 
-
-def sociodemo_calc(bounding_poly):
-    # Convert polygon to GeoJSON string
-    poly_geojson = json.dumps(mapping(bounding_poly))
-
-    # Define query columns and structure
-    columns = [
-        "geoid", "total", "total_male", "total_female", "original_area",
-        "intersect_area", "area_fraction", "estimated_total", "estimated_male",
-        "estimated_female"
-    ]
-
-    # Parameterized query with correct table qualification
-    query = """
+    # PostGIS query: intersect and weight ACS data by area
+    query = f"""
     SELECT
-        geoid,
-        total,
-        total_male,
-        total_female,
-        ST_Area(idaho_acs_bg.geometry::geography) AS original_area,
-        ST_Area(ST_Intersection(idaho_acs_bg.geometry, iso.geom)::geography) AS intersect_area,
-        (ST_Area(ST_Intersection(idaho_acs_bg.geometry, iso.geom)::geography) / ST_Area(idaho_acs_bg.geometry::geography)) AS area_fraction,
-        total * (ST_Area(ST_Intersection(idaho_acs_bg.geometry, iso.geom)::geography) / ST_Area(idaho_acs_bg.geometry::geography)) AS estimated_total,
-        total_male * (ST_Area(ST_Intersection(idaho_acs_bg.geometry, iso.geom)::geography) / ST_Area(idaho_acs_bg.geometry::geography)) AS estimated_male,
-        total_female * (ST_Area(ST_Intersection(idaho_acs_bg.geometry, iso.geom)::geography) / ST_Area(idaho_acs_bg.geometry::geography)) AS estimated_female
-    FROM
-        public.idaho_acs_bg idaho_acs_bg,
-        (SELECT ST_SetSRID(ST_GeomFromGeoJSON(%s), 4326) AS geom) AS iso
-    WHERE
-        ST_Intersects(idaho_acs_bg.geometry, iso.geom);
+    SUM(total *
+      (ST_Area(ST_Intersection(geometry, iso.geom)::geography) / ST_Area(geometry::geography))) AS estimated_total,
+    SUM(total_male *
+      (ST_Area(ST_Intersection(geometry, iso.geom)::geography) / ST_Area(geometry::geography))) AS estimated_male,
+    SUM(total_female *
+      (ST_Area(ST_Intersection(geometry, iso.geom)::geography) / ST_Area(geometry::geography))) AS estimated_female
+FROM
+    idaho_acs_bg,
+    (SELECT ST_SetSRID(ST_GeomFromGeoJSON('{poly_geojson}'), 4326) AS geom) AS iso
+WHERE
+    ST_Intersects(geometry, iso.geom);
     """
 
-    # Execute query and fetch results
-    try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SET search_path TO public, tiger;")
-            cursor.execute(query, (poly_geojson,))
-            rows = cursor.fetchall()
-            df = pd.DataFrame(rows, columns=columns)
-    except psycopg2.Error as e:
-        print(f"Database error: {e}")
-        raise
-    finally:
-        if 'cursor' in locals():
-            cursor.close()
+    cursor.execute(query)
+    row = cursor.fetchone()
+    conn.close()
 
-    return df
-
-
-# def sociodemo_calc(bounding_poly):
-#     # Convert polygon to GeoJSON string
-#     poly_geojson = json.dumps(mapping(bounding_poly))
-
-#     # Connect to Supabase (Postgres)
-#     conn = psycopg2.connect(
-#         dbname="postgres",
-#         user="postgres",
-#         password="7fxL0xfuw9w6PfPd",
-#         host="db.fiuxnvanhbujhwdwygto.supabase.co",
-#         port="5432"
-#     )
-#     cursor = conn.cursor()
-#     print(poly_geojson)
-#     # PostGIS query: intersect and weight ACS data by area
-#     query = f"""
-#     SELECT
-#        geoid,
-#        total,
-#        total_male,
-#        total_female,
-#        ST_Area(geometry::geography) AS original_area,
-#        ST_Area(ST_Intersection(geometry, iso.geom)::geography) AS intersect_area,
-#        (ST_Area(ST_Intersection(geometry, iso.geom)::geography) / ST_Area(geometry::geography)) AS area_fraction,
-#        total *
-#          (ST_Area(ST_Intersection(geometry, iso.geom)::geography) / ST_Area(geometry::geography)) AS estimated_total,
-#        total_male *
-#          (ST_Area(ST_Intersection(geometry, iso.geom)::geography) / ST_Area(geometry::geography)) AS estimated_male,
-#        total_female *
-#          (ST_Area(ST_Intersection(geometry, iso.geom)::geography) / ST_Area(geometry::geography)) AS estimated_female
-#    FROM
-#        idaho_acs_bg,
-#        (SELECT ST_SetSRID(ST_GeomFromGeoJSON('{poly_geojson}'), 4326) AS geom) AS iso
-#    WHERE
-#        ST_Intersects(geometry, iso.geom);
-#     """
-
-#     cursor.execute(query)
-#     rows = cursor.fetchall()
-#     columns = [desc[0] for desc in cursor.description]
-#     conn.close()
-
-#     # Convert to pandas DataFrame
-#     df = pd.DataFrame(rows, columns=columns)
-#     return df
-    
-# def main_calc(lat, lon, time_budget, mode, features_to_fetch):
-#     if mode == 'walk':
-#         travel_speed = 80 #m/min (about 3 mph)
-#     else: #bike
-#         travel_speed = 270 #m/min (about 10 mph)
-#     #get network
-#     bbox = bbox_calc(lat, lon, time_budget, travel_speed)
-#     G = ox.graph_from_bbox(bbox, network_type=mode)
-
-#     # Get the isochrone
-#     gdf_nodes = ox.graph_to_gdfs(G, edges=False)
-#     center_node = ox.distance.nearest_nodes(G,lon,lat, return_dist=False) #center_node is just a node ID not affected by projection
-#     #get best epsg
-#     epsg=epsg_calc(lat,lon)
-#     #G = ox.project_graph(G, to_crs={'init': 'epsg:2277'})
-#     G = ox.project_graph(G, to_crs=epsg)
-
-#     # add an edge attribute for time in minutes required to traverse each edge
-#     meters_per_minute = travel_speed * 1000 / 60 #km per hour to m per minute
-#     for u, v, k, data in G.edges(data=True, keys=True):
-#             data['time'] = data['length'] / meters_per_minute
-
-#     # make the isochrone polygons
-#     subgraph = nx.ego_graph(G, center_node, radius=time_budget, distance='time')
-#     node_points = [Point((data['x'], data['y'])) for node, data in subgraph.nodes(data=True)]
-#     bounding_poly = gpd.GeoSeries(node_points).unary_union.convex_hull
-#     #main_calc_data=[subgraph,bounding_poly]
-
-#     #Calculate feature proximities
-#     features_to_fetch=["water","school","park"]
-
-#     proximity_data = features_calc(lat, lon, bbox, epsg, bounding_poly, features_to_fetch)
-#     #Calculate socio demographic data
-
-#     socio_demo_data = sociodemo_calc(bounding_poly)
-#     #Calculate Job access
-#     #Job_access_data= job_calc()
+    return {
+        "total_popl": row[0],
+        "total_male": row[1],
+        "total_female": row[2]
+    }
 
     
-#     return proximity_data, socio_demo_data
-
 def main_calc(lat, lon, time_budget, mode, features_to_fetch):
+    # Validate input coordinates
+    if not (-90 <= lat <= 90):
+        raise ValueError(f"Invalid latitude: {lat}")
+    if not (-180 <= lon <= 180):
+        raise ValueError(f"Invalid longitude: {lon}")
+
+    # Travel speed
     if mode == 'walk':
         travel_speed = 80  # m/min (about 3 mph)
     else:  # bike
         travel_speed = 270  # m/min (about 10 mph)
+
     # Get network
     bbox = bbox_calc(lat, lon, time_budget, travel_speed)
+    print("BBOX:", bbox)
+    if not all(isinstance(coord, (int, float)) for coord in bbox):
+        raise ValueError("Invalid bounding box coordinates")
     G = ox.graph_from_bbox(bbox, network_type=mode)
+    if not G.nodes or not G.edges:
+        raise ValueError("Graph is empty; check bbox or network_type")
 
-    # Get the isochrone
+    # Get center node and project graph
     gdf_nodes = ox.graph_to_gdfs(G, edges=False)
     center_node = ox.distance.nearest_nodes(G, lon, lat, return_dist=False)
+    if center_node not in G.nodes:
+        raise ValueError("Center node not found in graph")
+    
     epsg = epsg_calc(lat, lon)
-    G = ox.project_graph(G, to_crs=epsg)
+    print(f"Lat: {lat}, Lon: {lon}, EPSG: {epsg}")
+    
+    # Validate EPSG code
+    try:
+        import pyproj
+        pyproj.CRS.from_epsg(epsg)
+    except Exception as e:
+        raise ValueError(f"Invalid EPSG code {epsg}: {e}")
+    
+    # Project graph
+    try:
+        G = ox.project_graph(G, to_crs=epsg)
+    except Exception as e:
+        raise ValueError(f"Failed to project graph to EPSG:{epsg}: {e}")
 
-    # Add an edge attribute for time in minutes
-    meters_per_minute = travel_speed * 1000 / 60
+    # Add edge time attribute
+    meters_per_minute = travel_speed * 1000 / 60  # km per hour to m per minute
     for u, v, k, data in G.edges(data=True, keys=True):
-        data['time'] = data['length'] / meters_per_minute
+        length = data.get('length', 0)
+        if length <= 0:
+            raise ValueError(f"Invalid edge length for edge ({u}, {v}, {k}): {length}")
+        data['time'] = length / meters_per_minute
 
-    # Make the isochrone polygon with validation
+    # Make isochrone polygons
     subgraph = nx.ego_graph(G, center_node, radius=time_budget, distance='time')
-    if subgraph.number_of_nodes() > 2:  # Ensure enough nodes for a polygon
-        node_points = [Point((data['x'], data['y'])) for node, data in subgraph.nodes(data=True)]
-        bounding_poly = gpd.GeoSeries(node_points).unary_union.convex_hull
-        if not bounding_poly.is_valid:
-            bounding_poly = bounding_poly.buffer(0)  # Repair invalid geometry
-    else:
-        # Fallback to a small buffer around the center if too few nodes
-        center_point = Point(lon, lat)
-        bounding_poly = center_point.buffer(100)  # 100m buffer as fallback
+    print("Subgraph nodes:", len(subgraph.nodes))
+    if len(subgraph.nodes) < 3:
+        raise ValueError("Subgraph has fewer than 3 nodes; cannot form a convex hull")
+
+    node_points = [Point((data['x'], data['y'])) for node, data in subgraph.nodes(data=True)]
+    if len(node_points) < 3:
+        raise ValueError(f"Insufficient points for convex hull: {len(node_points)}")
+
+    poly = gpd.GeoSeries(node_points).unary_union.convex_hull
+    if poly.is_empty or not poly.is_valid:
+        raise ValueError("Convex hull is empty or invalid")
+
+    poly_proj = gpd.GeoSeries([poly], crs=epsg)
+    bounding_poly_proj = poly_proj.iloc[0]  # Polygon for features_calc
+    bounding_poly_4326 = poly_proj.to_crs(epsg=4326)  # GeoSeries for to_json
+    print("BP->", bounding_poly_4326.iloc[0])
+
+    if not bounding_poly_4326.iloc[0].is_valid:
+        raise ValueError("Transformed polygon (EPSG:4326) is invalid")
+    if not bounding_poly_proj.is_valid:
+        raise ValueError("Projected polygon is invalid")
+
+    geojson_str = bounding_poly_4326.to_json()
+    print("GeoJSON:", geojson_str)
+    geojson_data = json.loads(geojson_str)
+    if not geojson_data.get("features"):
+        raise ValueError("GeoJSON has no features")
+    bounding_poly_geojson = geojson_data["features"][0]["geometry"]
 
     # Calculate feature proximities
-    proximity_data = features_calc(lat, lon, bbox, epsg, bounding_poly, features_to_fetch)
+    proximity_data = features_calc(lat, lon, bbox, epsg, bounding_poly_proj, features_to_fetch)
 
     # Calculate socio-demographic data
-    socio_demo_data = sociodemo_calc(bounding_poly)
+    socio_demo_data = sociodemo_calc(bounding_poly_4326.iloc[0])  # Assuming Polygon
 
-    return proximity_data, socio_demo_data
+    # Final result dictionary
+    return {
+        **proximity_data,
+        **socio_demo_data,
+        "bounding_poly_geojson": bounding_poly_geojson
+    }

@@ -53,14 +53,13 @@ class CalcISOAPIView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        proximity_data , sociodemo_data = main_calc(lat, lng, self.time_budget, mode, self.features_to_fetch)
+        res = main_calc(lat, lng, self.time_budget, mode, self.features_to_fetch)
         
         iso_result = {
             'lat': lat,
             'lng': lng,
             'mode': mode,
-            'proximity_data': proximity_data, 
-            'sociodemo_data': sociodemo_data
+            'result': res
         }
 
         return Response(iso_result, status=status.HTTP_200_OK)
