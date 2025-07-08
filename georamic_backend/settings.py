@@ -23,7 +23,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = "django-insecure-ztym03+=b4&o*vhmi-(l#_g#iys@*fzg@vbwi29i7^&wuxwfl$"
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = False
 
 ALLOWED_HOSTS = ['*']
 
@@ -42,14 +42,19 @@ INSTALLED_APPS = [
     'accesslite_app'
 ]
 
-CORS_ALLOWED_ORIGINS = [
-    'http://localhost:5173',
-]
+# CORS_ALLOWED_ORIGINS = [
+#     'http://localhost:5173',
+# ]
+CORS_ALLOW_ALL_ORIGINS = True  # Allow all origins for now (testing)
+
+CORS_ALLOW_METHODS = ['GET', 'POST', 'OPTIONS']
+CORS_ALLOW_HEADERS = ['content-type', 'accept', 'origin', 'authorization']
+CORS_LOGGING = True
 
 MIDDLEWARE = [
+    'corsheaders.middleware.CorsMiddleware',
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
-    'corsheaders.middleware.CorsMiddleware',
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
@@ -111,6 +116,9 @@ AUTH_PASSWORD_VALIDATORS = [
 REST_FRAMEWORK = {
     'DEFAULT_RENDERER_CLASSES': [
         'rest_framework.renderers.JSONRenderer',  # Only render JSON
+    ],
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.AllowAny',  # Allow all for testing
     ],
 }
 
