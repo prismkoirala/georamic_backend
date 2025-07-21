@@ -152,12 +152,20 @@ def sociodemo_calc(bounding_poly):
     poly_geojson = json.dumps(mapping(bounding_poly))
 
     # Connect to Supabase (Postgres)
+    # conn = psycopg2.connect(
+    #     dbname="postgres",
+    #     user="postgres",
+    #     password="7fxL0xfuw9w6PfPd",
+    #     host="db.fiuxnvanhbujhwdwygto.supabase.co",
+    #     port="5432",
+    # )
+
     conn = psycopg2.connect(
-        dbname="postgres",
-        user="postgres",
-        password="7fxL0xfuw9w6PfPd",
-        host="db.fiuxnvanhbujhwdwygto.supabase.co",
-        port="5432"
+        user='postgres.fiuxnvanhbujhwdwygto',
+        password='7fxL0xfuw9w6PfPd',
+        host='aws-0-us-west-1.pooler.supabase.com',
+        port='6543',
+        dbname='postgres'
     )
     cursor = conn.cursor()
 
